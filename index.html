@@ -28,6 +28,7 @@
     .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f1f5f9; font-size:12px; }
     @media (max-width: 760px) { .pair { flex-direction: column; flex-wrap: nowrap; } }
     #canvas { display: none; }
+    .pair.hidden { display: none; } /* カメラプレビュー非表示用 */
 
     /* ▼ 感度調整パネル ▼ */
     .sensitivity-section {
@@ -132,8 +133,9 @@
         <button id="startBtn" class="primary">測定開始</button>
         <button id="calibBtn" disabled>正しい姿勢の基準</button>
         <button id="resetBtn" disabled>解除</button>
+        <button id="togglePreviewBtn" disabled>プレビュー非表示</button>
       </div>
-      <div class="pair">
+      <div class="pair" id="previewPair">
         <video id="video" autoplay muted playsinline></video>
         <canvas id="canvas"></canvas>
       </div>
@@ -232,6 +234,16 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
 
   <script>
+    // ========== 定数定義 ==========
+    const CONSTANTS = {
+      FPS_LIMIT_MS: 100,              // FPS制限（10fps）
+      CALIBRATION_DURATION_MS: 3000,  // キャリブレーション時間（3秒）
+      FACE_LOST_TOLERANCE_MS: 2000,   // 顔検出失敗の許容時間（2秒）
+      CAMERA_WIDTH: 640,              // カメラ解像度（幅）
+      CAMERA_HEIGHT: 480,             // カメラ解像度（高さ）
+      MESSAGE_DISPLAY_MS: 2000,       // 一時メッセージの表示時間（2秒）
+    };
+
     // ========== 設定/状態 ==========
     const PARAMS = {
       alphaPitch: 0.25, alphaRoll: 0.25, alphaYdiff: 0.3, alphaNoseZ: 0.25,
@@ -259,6 +271,8 @@
     const startBtn = document.getElementById('startBtn');
     const calibBtn = document.getElementById('calibBtn');
     const resetBtn = document.getElementById('resetBtn');
+    const togglePreviewBtn = document.getElementById('togglePreviewBtn');
+    const previewPair = document.getElementById('previewPair');
 
     let rawPitch=0, rawRoll=0;
     let sPitch=0, sRoll=0, sYdiff=null, sNoseZ=null;
@@ -266,6 +280,9 @@
     let bentState = false;
     let enterStart = null, exitStart  = null;
     let wasDown = false, wasUp = false, wasClose = false, wasFar = false;
+
+    // ★ 顔検出ロスト対策
+    let faceLostStartTime = null;
 
     // ★ 3秒キャリブレーション状態
     let calibMode = false;
@@ -460,10 +477,25 @@
       } catch {}
     }
 
-    // ========== センサー ==========
+    // ========== センサー（横画面対応） ==========
     function handleOrientation(e){
-      rawPitch = (e.beta  ?? 0);
-      rawRoll  = (e.gamma ?? 0);
+      const beta  = e.beta  ?? 0;
+      const gamma = e.gamma ?? 0;
+
+      // ★ 画面の向きを取得（縦/横）
+      const orientation = screen?.orientation?.type || 'portrait-primary';
+      const isLandscape = orientation.includes('landscape');
+
+      if (isLandscape) {
+        // 横画面：beta/gammaの役割が入れ替わる
+        rawPitch = gamma;  // 横画面では gamma が上下の傾き
+        rawRoll = beta;    // 横画面では beta が左右の傾き
+      } else {
+        // 縦画面：通常通り
+        rawPitch = beta;
+        rawRoll = gamma;
+      }
+
       sPitch = PARAMS.alphaPitch * rawPitch + (1 - PARAMS.alphaPitch) * sPitch;
       sRoll  = PARAMS.alphaRoll  * rawRoll  + (1 - PARAMS.alphaRoll ) * sRoll;
     }
@@ -473,21 +505,31 @@
     faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
 
     faceMesh.onResults(results => {
-      // FPS制限（10fps）
+      // FPS制限
       const now = performance.now();
-      if (now - lastInferenceTs < 100) return;
+      if (now - lastInferenceTs < CONSTANTS.FPS_LIMIT_MS) return;
       lastInferenceTs = now;
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
       if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
-        faceDetected = false;
-        setWarning(true, '顔が検出できません');
-        output.textContent = '顔が見つかりません';
+        // ★ 顔検出失敗時：即座にエラー表示せず、2秒間の猶予を設ける
+        const now = performance.now();
+        if (faceLostStartTime === null) {
+          faceLostStartTime = now;
+        } else if (now - faceLostStartTime > CONSTANTS.FACE_LOST_TOLERANCE_MS) {
+          faceDetected = false;
+          setWarning(true, '顔が検出できません');
+          output.textContent = '顔が見つかりません';
+        }
+        // bentStateはすぐには解除しない（一時的に隠れただけの可能性）
         return;
       }
+
+      // 顔が検出された：ロストタイマーをリセット
       faceDetected = true;
+      faceLostStartTime = null;
 
       const lm = results.multiFaceLandmarks[0];
       const nose = lm[1];
@@ -502,11 +544,18 @@
       sYdiff = (sYdiff == null) ? yDiff : PARAMS.alphaYdiff * yDiff + (1 - PARAMS.alphaYdiff) * sYdiff;
       sNoseZ = (sNoseZ == null) ? noseZ : PARAMS.alphaNoseZ * noseZ + (1 - PARAMS.alphaNoseZ) * sNoseZ;
 
-      // ★ 3秒キャリブレーション処理
+      // ★ キャリブレーション処理（カウントダウン表示付き）
       if (calibMode) {
         const elapsed = performance.now() - calibStartTs;
+        const remaining = Math.ceil((CONSTANTS.CALIBRATION_DURATION_MS - elapsed) / 1000);
         calibSamples.push({ y: sYdiff, z: sNoseZ });
-        if (elapsed >= 3000) {
+
+        // カウントダウン表示
+        if (remaining > 0) {
+          setWarning(false, `良い姿勢をキープ... ${remaining}秒`);
+        }
+
+        if (elapsed >= CONSTANTS.CALIBRATION_DURATION_MS) {
           const avgY = calibSamples.reduce((s, x) => s + x.y, 0) / calibSamples.length;
           const avgZ = calibSamples.reduce((s, x) => s + x.z, 0) / calibSamples.length;
           PARAMS.calibYdiff = avgY;
@@ -514,7 +563,12 @@
           saveCalibration(avgY, avgZ);
           calibMode = false;
           calibSamples = [];
-          setWarning(false, 'キャリブレーションが完了しました！');
+          setWarning(false, '✓ キャリブレーション完了！');
+          setTimeout(() => {
+            if (faceDetected) {
+              setWarning(bentState, bentState ? '首が曲がっています' : '首は曲がっていません');
+            }
+          }, CONSTANTS.MESSAGE_DISPLAY_MS);
         }
         return;
       }
@@ -617,22 +671,33 @@
       }
     }
 
-    // ★ 最終判定（端末角度も考慮）★感度調整対応＆改善版
+    // ★ 最終判定（端末角度も考慮）★感度調整対応＆スマホ角度補正強化版
     function isBent(dir, prox, pitchAbs){
       // ★ 調整可能な閾値を使用
       if (prox === '顔が近い' && pitchAbs <= PARAMS.pitchThreshold1) return true;
-      
-      // ★ 改善：dir='straight'の場合は、より厳しい条件で判定
+
+      // ★ 改善：スマホを机に置いた状態（pitchが大きい）でも判定
+      // pitchが大きい = スマホが寝ている = 首が曲がりやすい姿勢
+      if (pitchAbs > PARAMS.pitchThreshold2) {
+        // スマホが寝ている場合は、より厳格に判定
+        // 顔が下向き（down）または近距離の場合は警告
+        if (dir === 'down') return true;
+        if (prox === '顔が近い') return true;
+        return false;
+      }
+
+      // 通常のスマホ角度での判定
       if (pitchAbs <= PARAMS.pitchThreshold2) {
         if (dir === 'down') return true;  // downは確実に警告
         if (dir === 'straight' && pitchAbs <= PARAMS.straightThreshold) return true;  // straightは調整可能な閾値以下のみ
         return false;
       }
-      
-      return (dir === 'down');
+
+      return false;
     }
 
     // ★ 修正：表示は毎フレーム同期。顔が見えていれば bentState の内容で常に上書き。
+    // ★ 改善：具体的な姿勢改善ガイダンスを表示
     function updateSustain(isNow){
       const t = performance.now();
       if (isNow) {
@@ -641,7 +706,6 @@
         const elapsed = t - enterStart;
         if (!bentState && elapsed >= PARAMS.sustainMs) {
           bentState = true;
-          setWarning(true, '首が曲がっています');
           startBeepLoop();
         }
       } else {
@@ -650,14 +714,26 @@
         const elapsed = t - exitStart;
         if (bentState && elapsed >= PARAMS.clearMs) {
           bentState = false;
-          setWarning(false, '首は曲がっていません');
           stopBeepLoop();
         }
       }
 
-      // ★ 毎フレーム：顔が見えている間は最新状態を反映
+      // ★ 毎フレーム：顔が見えている間は最新状態を反映（具体的ガイダンス付き）
       if (faceDetected) {
-        setWarning(bentState, bentState ? '首が曲がっています' : '首は曲がっていません');
+        if (bentState) {
+          // 状態に応じた具体的なアドバイス
+          let advice = '首が曲がっています';
+          if (faceState.prox === '顔が近い') {
+            advice = '⚠️ 画面に近すぎます → スマホを離してください';
+          } else if (faceState.dir === 'down') {
+            advice = '⚠️ 首が下向きです → 顔を上げ、スマホを目線の高さに';
+          } else {
+            advice = '⚠️ 姿勢を改善してください → 背筋を伸ばして';
+          }
+          setWarning(true, advice);
+        } else {
+          setWarning(false, '✓ 良い姿勢です');
+        }
       }
     }
 
@@ -669,27 +745,70 @@
     }
 
     async function initCamera(){
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: {ideal: 640}, height: {ideal: 480} },
-        audio: false
-      });
-      video.srcObject = stream;
-      await new Promise(r => video.onloadedmetadata = r);
-      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: {ideal: CONSTANTS.CAMERA_WIDTH}, height: {ideal: CONSTANTS.CAMERA_HEIGHT} },
+          audio: false
+        });
+        video.srcObject = stream;
+        await new Promise(r => video.onloadedmetadata = r);
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      } catch (err) {
+        // ★ カメラ初期化失敗時のエラーハンドリング強化
+        setWarning(true, 'カメラエラー');
+        if (err.name === 'NotAllowedError') {
+          output.textContent =
+            '⚠️ カメラの利用が許可されませんでした\n\n' +
+            '【解決方法】\n' +
+            '1. ブラウザのアドレスバー横のカメラアイコンをタップ\n' +
+            '2. カメラへのアクセスを「許可」に変更\n' +
+            '3. ページを再読み込み';
+        } else if (err.name === 'NotFoundError') {
+          output.textContent = 'カメラが見つかりませんでした。お使いのデバイスにカメラが搭載されているか確認してください。';
+        } else {
+          output.textContent = `カメラエラー: ${err.message}`;
+        }
+        startBtn.disabled = false; // 再試行可能にする
+        throw err; // エラーを上位に伝播
+      }
     }
 
     async function startAll(){
       if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
         try {
           const res = await DeviceOrientationEvent.requestPermission();
-          if (res === 'granted') window.addEventListener('deviceorientation', handleOrientation);
-          else { output.textContent = 'センサーの利用が許可されませんでした。'; return; }
-        } catch { output.textContent = 'センサー許可でエラーが発生しました。'; return; }
+          if (res === 'granted') {
+            window.addEventListener('deviceorientation', handleOrientation);
+          } else {
+            // ★ iOS許可拒否時：わかりやすいメッセージと再試行方法を表示
+            setWarning(true, 'センサー許可が必要です');
+            output.textContent =
+              '⚠️ センサーの利用が許可されませんでした\n\n' +
+              '【解決方法】\n' +
+              '1. 設定 > Safari > プライバシーとセキュリティ\n' +
+              '2. 「モーションと画面の向き」をオンにする\n' +
+              '3. このページを再読み込みして再試行\n\n' +
+              'または「測定開始」ボタンを再度押してください';
+            startBtn.disabled = false; // 再試行可能にする
+            return;
+          }
+        } catch (err) {
+          setWarning(true, 'センサーエラー');
+          output.textContent = `センサー許可でエラーが発生しました: ${err.message}\n\niOS 13以降では設定からモーションセンサーの許可が必要です。`;
+          startBtn.disabled = false;
+          return;
+        }
       } else {
         window.addEventListener('deviceorientation', handleOrientation);
       }
 
-      await initCamera();
+      // ★ カメラ初期化（エラー時は処理を中断）
+      try {
+        await initCamera();
+      } catch (err) {
+        console.error('カメラ初期化エラー:', err);
+        return; // エラー時は処理を中断
+      }
 
       // ユーザー操作直後にオーディオを有効化（iOS自動再生制限対策）
       ensureAudio();
@@ -697,15 +816,15 @@
       camera = new Camera(video, {
         onFrame: async () => {
           const t = performance.now();
-          if (t - lastInferenceTs >= 100) {
+          if (t - lastInferenceTs >= CONSTANTS.FPS_LIMIT_MS) {
             await faceMesh.send({ image: video });
           }
         },
-        width: 640, height: 480
+        width: CONSTANTS.CAMERA_WIDTH, height: CONSTANTS.CAMERA_HEIGHT
       });
       camera.start();
 
-      startBtn.disabled = true; calibBtn.disabled = false; resetBtn.disabled = false;
+      startBtn.disabled = true; calibBtn.disabled = false; resetBtn.disabled = false; togglePreviewBtn.disabled = false;
 
       const saved = loadCalibration();
       if (saved) {
@@ -727,7 +846,17 @@
       }, { passive: true });
     }
 
-    // 3秒平均キャリブ
+    // ★ ヒステリシス状態のリセット関数
+    function resetHysteresisStates(){
+      wasDown = false;
+      wasUp = false;
+      wasClose = false;
+      wasFar = false;
+      enterStart = null;
+      exitStart = null;
+    }
+
+    // キャリブレーション開始
     function calibrate(){
       if (sYdiff == null || sNoseZ == null) {
         setWarning(true, 'まだ値が安定していません。数秒待ってからもう一度試してください');
@@ -736,6 +865,8 @@
       calibMode = true;
       calibSamples = [];
       calibStartTs = performance.now();
+      // ★ キャリブレーション開始時にヒステリシス状態をリセット
+      resetHysteresisStates();
       setWarning(false, '良い姿勢で3秒間そのまま静止してください');
     }
 
@@ -745,6 +876,8 @@
       calibSamples = [];
       calibStartTs = 0;
       localStorage.removeItem('posture-calib');
+      // ★ キャリブレーション解除時にもヒステリシス状態をリセット
+      resetHysteresisStates();
       setWarning(false, 'キャリブを解除しました');
     }
 
@@ -898,7 +1031,7 @@
       setWarning(false, 'ログを全削除しました');
     }
 
-    // ========== YouTube URL 解析 ==========
+    // ========== YouTube URL 解析（XSS対策強化版） ==========
     function parseYouTube(urlStr) {
       try {
         const u = new URL(urlStr);
@@ -909,9 +1042,15 @@
           else if (u.pathname.startsWith('/shorts/')) id = u.pathname.split('/')[2];
           else if (u.pathname.startsWith('/live/'))   id = u.pathname.split('/')[2];
         } else if (host === 'youtu.be') {
-          id = u.pathname.slice(1);
+          id = u.pathname.slice(1).split('?')[0]; // クエリパラメータを除去
         }
-        return id;
+
+        // ★ セキュリティ: video IDの厳格な検証
+        // YouTube video IDは11文字、英数字・ハイフン・アンダースコアのみ
+        if (id && /^[a-zA-Z0-9_-]{11}$/.test(id)) {
+          return id;
+        }
+        return null;
       } catch {
         return null;
       }
@@ -925,6 +1064,19 @@
       startBtn.addEventListener('click', startAll);
       calibBtn.addEventListener('click', calibrate);
       resetBtn.addEventListener('click', resetCalibration);
+
+      // カメラプレビューのトグル
+      let previewVisible = true;
+      togglePreviewBtn.addEventListener('click', () => {
+        previewVisible = !previewVisible;
+        if (previewVisible) {
+          previewPair.classList.remove('hidden');
+          togglePreviewBtn.textContent = 'プレビュー非表示';
+        } else {
+          previewPair.classList.add('hidden');
+          togglePreviewBtn.textContent = 'プレビュー表示';
+        }
+      });
 
       const logStartBtn  = document.getElementById('logStartBtn');
       const logStopBtn   = document.getElementById('logStopBtn');
