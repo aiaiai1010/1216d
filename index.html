@@ -584,9 +584,14 @@
       const isBentNow = isBent(faceState.dir, faceState.prox, pitchAbs);
       updateSustain(isBentNow);
 
+      // ★ 首角度の推定
+      const neckAngle = estimateNeckAngle(sYdiff, sNoseZ, pitchAbs);
+
       // デバッグ出力
       const combined = getCombinedForDebug();
       output.textContent =
+        `【首角度推定】${neckAngle.toFixed(1)}°\n` +
+        `─────────────────\n` +
         `Pitch: ${sPitch.toFixed(2)}°\n` +
         `Roll:  ${sRoll.toFixed(2)}°\n` +
         `yDiff(平滑): ${sYdiff.toFixed(4)}\n` +
@@ -599,6 +604,33 @@
       // ログ記録（1秒粒度）
       addLogSample();
     });
+
+    // ★ 首角度の推定関数
+    function estimateNeckAngle(yDiff, noseZ, pitchAbs) {
+      // 顔の下向き度合いから角度を推定
+      // yDiff: 大きいほど下向き（chin.y - nose.yなので正の値が大きいほど下向き）
+      // 基準値からの差分を角度に変換（経験的な係数）
+
+      let baseYDiff = PARAMS.calibYdiff ?? 0.12; // キャリブ値または標準値
+      let faceAngle = (yDiff - baseYDiff) * 100; // 顔の傾き角度（度）
+
+      // noseZ（顔の距離）による補正
+      // 顔が近いほど下を向いている可能性が高い
+      let baseNoseZ = PARAMS.calibNoseZ ?? 0;
+      let distanceFactor = (noseZ - baseNoseZ) * 20;
+
+      // スマホの角度による補正
+      // スマホが寝ている（pitchが大きい）場合、見かけの首角度は小さく見える
+      let phoneFactor = pitchAbs * 0.3;
+
+      // 総合的な首角度の推定
+      let neckAngle = faceAngle + distanceFactor - phoneFactor;
+
+      // 0-90度の範囲に制限
+      neckAngle = Math.max(0, Math.min(90, neckAngle));
+
+      return neckAngle;
+    }
 
     function drawPoint(normLandmark, color) {
       const x = normLandmark.x * canvas.width;
@@ -720,19 +752,22 @@
 
       // ★ 毎フレーム：顔が見えている間は最新状態を反映（具体的ガイダンス付き）
       if (faceDetected) {
+        // 首角度を取得（updateSustainの外で計算済み）
+        const currentNeckAngle = estimateNeckAngle(sYdiff ?? 0, sNoseZ ?? 0, Math.abs(sPitch));
+
         if (bentState) {
-          // 状態に応じた具体的なアドバイス
-          let advice = '首が曲がっています';
+          // 状態に応じた具体的なアドバイス（首角度付き）
+          let advice = `⚠️ 首角度 ${currentNeckAngle.toFixed(0)}° - `;
           if (faceState.prox === '顔が近い') {
-            advice = '⚠️ 画面に近すぎます → スマホを離してください';
+            advice += '画面に近すぎます';
           } else if (faceState.dir === 'down') {
-            advice = '⚠️ 首が下向きです → 顔を上げ、スマホを目線の高さに';
+            advice += '首が下向きです';
           } else {
-            advice = '⚠️ 姿勢を改善してください → 背筋を伸ばして';
+            advice += '姿勢を改善してください';
           }
           setWarning(true, advice);
         } else {
-          setWarning(false, '✓ 良い姿勢です');
+          setWarning(false, `✓ 良い姿勢です（首角度 ${currentNeckAngle.toFixed(0)}°）`);
         }
       }
     }
@@ -943,6 +978,9 @@
 
       const ts = Date.now();
       const d = new Date(ts);
+      const pitchAbs = Math.abs(sPitch);
+      const neckAngle = estimateNeckAngle(sYdiff ?? 0, sNoseZ ?? 0, pitchAbs);
+
       const entry = {
         ts,
         day: ymdFromTs(ts),
@@ -952,6 +990,7 @@
         dir: faceState.dir,
         prox: faceState.prox,
         bent: !!bentState,
+        neckAngle: neckAngle,  // ★ 首角度を追加
         // ★ 感度設定もログに記録
         pitchThreshold1: PARAMS.pitchThreshold1,
         pitchThreshold2: PARAMS.pitchThreshold2,
@@ -982,7 +1021,7 @@
 
       const tx = db.transaction(STORE, 'readonly');
       const store = tx.objectStore(STORE);
-      const rows = [['ts','iso','day','hour','pitch','roll','y','z','dir','prox','bent','pitchThreshold1','pitchThreshold2','straightThreshold','dirSensitivity','proxSensitivity']];
+      const rows = [['ts','iso','day','hour','pitch','roll','y','z','dir','prox','bent','neckAngle','pitchThreshold1','pitchThreshold2','straightThreshold','dirSensitivity','proxSensitivity']];
       const req = store.openCursor();
       await new Promise((resolve, reject) => {
         req.onsuccess = (e) => {
@@ -1001,6 +1040,7 @@
             v.dir,
             v.prox,
             v.bent ? 1 : 0,
+            v.neckAngle?.toFixed?.(1) || 0,  // ★ 首角度を追加
             v.pitchThreshold1 || 30,
             v.pitchThreshold2 || 40,
             v.straightThreshold || 25,
